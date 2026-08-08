@@ -1,0 +1,10 @@
+# Core local AI engine dependencies
+opencv-python==4.10.0.84
+ultralytics==8.3.0
+pyserial==3.5
+numpy==1.26.4
+
+# Optional: enable only when SMARTSEG_SYNC_ENABLED=true and credentials are configured.
+firebase-admin==6.5.0
+# Optional: enable only when SMARTSEG_SMS_PROVIDER=twilio and Twilio credentials are configured.
+twilio==9.3.1

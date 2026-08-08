@@ -1,0 +1,1 @@
+"""SmartSeg API routers."""

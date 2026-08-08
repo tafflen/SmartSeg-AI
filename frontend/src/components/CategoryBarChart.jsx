@@ -1,0 +1,3 @@
+import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+const categories = ['PLASTIC','ORGANIC','METAL','OTHER']; const fills = { PLASTIC:'#3A7CA5', ORGANIC:'#4F8A5B', METAL:'#7A7F85', OTHER:'#D49A29' }
+export default function CategoryBarChart({ data }) { return <ResponsiveContainer width="100%" height={280}><BarChart data={data}><CartesianGrid stroke="#D8D4C8" vertical={false}/><XAxis dataKey="label" tick={{fontSize:12}}/><YAxis allowDecimals={false}/><Tooltip/><Legend/>{categories.map((category) => <Bar key={category} dataKey={category} stackId="a" fill={fills[category]}/>)}</BarChart></ResponsiveContainer> }

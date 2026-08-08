@@ -1,0 +1,15 @@
+# ---- Core ----
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+sqlalchemy>=2.0,<3.0
+pydantic>=2.0,<3.0
+python-jose[cryptography]>=3.3,<4.0
+passlib[bcrypt]>=1.7,<2.0
+pyserial>=3.5,<4.0
+opencv-python>=4.10,<5.0
+
+# ---- Optional, off by default ----
+# firebase-admin>=6.0,<7.0
+
+# ---- Heavy — install separately later ----
+# ultralytics>=8.0,<9.0
