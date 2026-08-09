@@ -60,7 +60,8 @@ npm install
 cd ..
 ```
 
-On macOS/Linux, use `python3.11 -m venv .venv`, `source .venv/bin/activate`, and `bash start_all.sh`. For firmware, install Arduino IDE 2.x, select **Arduino Uno**, and upload [smartseg_firmware.ino](arduino-firmware/smartseg_firmware.ino).
+On macOS/Linux, use `python3.11 -m venv .venv`, `source .venv/bin/activate`, and `bash start_all.sh`. 
+For firmware, install Arduino IDE 2.x, select **Arduino Uno**, and upload [smartseg_firmware.ino](arduino-firmware/smartseg_firmware.ino).
 
 ### Configure
 
@@ -87,17 +88,9 @@ On macOS/Linux, use `python3.11 -m venv .venv`, `source .venv/bin/activate`, and
 bash start_all.sh
 ```
 
-On Windows run `start_all.bat`. Logs are prefixed `[AI]`, `[BACKEND]`, and `[FRONTEND]`; Ctrl+C stops all services. Open [the dashboard](http://localhost:5173) and [API docs](http://localhost:8000/docs). For the safest presentation fallback, set `SMARTSEG_SIMULATE_MODE=true` before launch.
-
-## Demo screenshots
-
-Add polished screenshots here before submission:
-
-1. `docs/images/resident-dashboard.png` — wallet, history, and sorting mix.
-2. `docs/images/rwa-dashboard.png` — society totals, chart, and leaderboard.
-3. `docs/images/gcc-dashboard.png` — compliance view.
-4. `docs/images/nfc-registration.png` — admin card-linking flow.
-5. `docs/images/hardware-station.png` — conveyor, bins, Arduino, and NFC reader.
+On Windows run `start_all.bat`. Logs are prefixed `[AI]`, `[BACKEND]`, and `[FRONTEND]`; Ctrl+C stops all services. 
+Open [the dashboard](http://localhost:5173) and [API docs](http://localhost:8000/docs). 
+For the safest presentation fallback, set `SMARTSEG_SIMULATE_MODE=true` before launch.
 
 ## Known limitations
 
@@ -114,16 +107,3 @@ Add polished screenshots here before submission:
 - Use encrypted NFC tags or NFC + PIN for stronger identity verification.
 - Package the laptop software as an edge appliance for managed deployments.
 - Fine-tune a larger YOLO model on an Indian household-waste dataset and integrate municipal systems.
-
-## Documentation
-
-- [Architecture and event sequence](docs/architecture_diagram.md)
-- [Wiring diagram and bill of materials](docs/wiring_diagram.md)
-- [NFC setup](docs/nfc_setup.md)
-- [API reference](docs/api_documentation.md)
-- [Database ERD](docs/database_schema.md)
-- [Installation guide](docs/installation_guide.md)
-- [Testing guide](docs/testing_guide.md)
-- [End-to-end demo rehearsal](docs/end_to_end_test_plan.md)
-- [Integration fixes](docs/integration_fixes.md)
-- [Future roadmap](docs/future_improvements.md)
