@@ -60,6 +60,12 @@ npm install
 cd ..
 ```
 
+```powershell
+Terminal 1 (ai-engine): cd ai-engine → python main.py
+Terminal 2 (backend): cd backend → uvicorn main:app --reload
+Terminal 3 (frontend): cd frontend → npm run dev
+```
+
 On macOS/Linux, use `python3.11 -m venv .venv`, `source .venv/bin/activate`, and `bash start_all.sh`. 
 For firmware, install Arduino IDE 2.x, select **Arduino Uno**, and upload [smartseg_firmware.ino](arduino-firmware/smartseg_firmware.ino).
 
