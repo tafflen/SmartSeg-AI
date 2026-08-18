@@ -13,3 +13,4 @@ opencv-python>=4.10,<5.0
 
 # ---- Heavy — install separately later ----
 # ultralytics>=8.0,<9.0
+ultralytics>=8.0

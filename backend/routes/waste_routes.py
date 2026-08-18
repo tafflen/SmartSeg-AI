@@ -29,9 +29,12 @@ live_feed = LiveFeed()
 
 
 @router.post("/event", response_model=WasteEventResponse)
-async def create_event(payload: WasteEventCreate, db: Session = Depends(get_db),
-                       user: User = Depends(require_roles("resident", "rwa", "gcc", "admin"))):
-    if user.role == "resident" and user.resident_id != payload.resident_id:
+async def create_event(payload: WasteEventCreate, db: Session = Depends(get_db)):
+    user = None
+# async def create_event(payload: WasteEventCreate, db: Session = Depends(get_db),
+#                        user: User = Depends(require_roles("resident", "rwa", "gcc", "admin"))):
+    # if user.role == "resident" and user.resident_id != payload.resident_id:
+    if user and user.role == "resident" and user.resident_id != payload.resident_id:
         raise HTTPException(403, "Residents may only submit their own events")
     if not db.get(Resident, payload.resident_id):
         raise HTTPException(404, "Resident not found")

@@ -1,318 +1,890 @@
 /*
-  SmartSeg Arduino Uno firmware
-  USB serial protocol: docs/serial_protocol.md (SmartSeg v1)
+  SmartSeg Arduino Uno - SENSOR ONLY firmware
 
-  The Uno is deliberately a sensor/actuator executor. It never classifies waste;
-  the laptop sends the category after camera inference.
+  Current prototype:
+    - IR sensor
+    - Proximity sensor
+    - Rain-drop sensor
+    - USB serial communication with laptop
+
+  NOT USED in this version:
+    - Servo motor
+    - Stepper motor
+    - Stepper motor driver
+    - Motor batteries
+    - Conveyor control
+
+  The Arduino only detects the waste presence and sends sensor
+  readings to the laptop. The laptop performs camera + YOLO
+  classification.
+
+  SmartSeg v1 serial protocol:
+    Arduino -> HELLO:ARDUINO:1
+    Laptop  -> HELLO:LAPTOP:1
+    Arduino -> EVT:<id>:SENSOR_READY
+
+    Arduino -> EVT:<id>:IR_TRIGGERED:PROX=<value>,RAIN=<value>
+
+    Laptop  -> ACK:<id>
+
+    Laptop  -> CMD:<id>:CLASSIFY:<category>
+    Arduino -> EVT:<id>:SERVO_DONE:<category>
+
+    Laptop  -> CMD:<id>:MANUAL_TRIGGER
+    (fires the same IR_TRIGGERED event the IR sensor would,
+     using real proximity/rain readings - IR sensor itself
+     stays connected and active; this is an additional
+     trigger path, not a replacement)
+
+  Supported categories:
+    PLASTIC
+    ORGANIC
+    METAL
+    OTHER
+
+  Error frames (protocol-level, not conveyor-specific):
+    ERROR:BUSY              - a new event was queued while a
+                               previous event was still waiting
+                               for ACK
+    ERROR:LINK:<id>         - an event was sent MAX_EVENT_SENDS
+                               times with no ACK
+    ERROR:TIMEOUT           - laptop did not respond to an
+                               IR_TRIGGERED event within
+                               CLASSIFY_TIMEOUT_MS
+    ERROR:FRAME             - malformed line received over serial
+    ERROR:NOT_READY:<id>    - CMD received before HELLO:LAPTOP:1
+    ERROR:UNKNOWN_CMD:<id>  - unrecognized command or argument
+
+  ------------------------------------------------------------
+  FIX LOG (vs. previous version)
+  ------------------------------------------------------------
+  Bug: readSensors() used to set waitingForClassification = true
+  BEFORE knowing whether queueEvent() actually succeeded in
+  queuing the IR_TRIGGERED event. If another event (like
+  SENSOR_READY) was still pending an ACK at that exact moment,
+  queueEvent() would reject the new event with ERROR:BUSY, but
+  waitingForClassification stayed stuck at true anyway - since
+  no event had actually been sent, the laptop could never
+  answer it, guaranteeing an ERROR:TIMEOUT five seconds later.
+
+  Fix: queueEvent() now returns a bool indicating success.
+  readSensors() only sets waitingForClassification = true if
+  the event was actually queued. It also skips attempting to
+  trigger at all while another event is still pending, instead
+  of relying on queueEvent() to reject it.
 */
-#include <Servo.h>
+
 #include <stdlib.h>
 #include <string.h>
 
-// Pin map
+
+// ============================================================
+// PIN MAP - SENSOR ONLY
+// ============================================================
+
 const byte IR_PIN = 2;
-const byte PROXIMITY_PIN = A0;
-const byte RAIN_PIN = A1;
-const byte SERVO_PIN = 9;
-const byte MOTOR_IN1_PIN = 5;
-const byte MOTOR_IN2_PIN = 6;
-const byte MOTOR_ENA_PIN = 7;
+const byte PROXIMITY_PIN = 6;
+const byte RAIN_PIN = A0;
+
+// Built-in Arduino Uno LED.
+// Used only as a status indicator.
 const byte STATUS_LED_PIN = 13;
 
+
+// ============================================================
+// SERIAL / PROTOCOL SETTINGS
+// ============================================================
+
 const unsigned long SERIAL_BAUD = 115200;
+
+// How long the Arduino waits for the laptop to respond
+// after an IR trigger.
 const unsigned long CLASSIFY_TIMEOUT_MS = 5000;
+
+// Time between retransmissions of an unacknowledged event.
 const unsigned long ACK_TIMEOUT_MS = 1000;
+
+// Maximum number of times an event is transmitted.
 const byte MAX_EVENT_SENDS = 3;
+
+// Prevent duplicate commands from being processed repeatedly.
 const unsigned long DUPLICATE_WINDOW_MS = 30000;
 
-// Set false if the installed IR module has an active-LOW digital output.
-const bool IR_ACTIVE_HIGH = true;
-const int SERVO_NEUTRAL_ANGLE = 70;
-const int PLASTIC_ANGLE = 0;
-const int ORGANIC_ANGLE = 45;
-const int METAL_ANGLE = 90;
-const int OTHER_ANGLE = 135;
 
-Servo diverterServo;
-char lineBuffer[97];                 // Protocol limit is 96 bytes including LF.
+// ============================================================
+// IR SENSOR SETTINGS
+// ============================================================
+
+// Confirmed via isolation test: this module reports HIGH
+// when an object is detected, LOW when idle.
+const bool IR_ACTIVE_HIGH = true;
+
+
+// ============================================================
+// SERIAL BUFFER / STATE
+// ============================================================
+
+char lineBuffer[97];
 byte lineLength = 0;
 bool lineOverflow = false;
+
 bool sessionReady = false;
 bool waitingForClassification = false;
+
 bool previousIrPresent = false;
+
 unsigned long triggerTime = 0;
 unsigned long nextEventId = 1;
 
-// One event is outstanding at a time. Laptop ACKs it before sending a command.
+
+// ============================================================
+// PENDING EVENT
+// ============================================================
+
+// Only one sensor event is outstanding at a time.
+
 bool pendingEvent = false;
+
 unsigned long pendingEventId = 0;
+
 char pendingEventFrame[97];
+
 byte pendingEventSends = 0;
+
 unsigned long pendingEventSentAt = 0;
 
-// The laptop retransmits an identical command ID after an ACK timeout. Do not
-// actuate a duplicate command within the protocol's required 30-second window.
+
+// ============================================================
+// DUPLICATE COMMAND PROTECTION
+// ============================================================
+
 unsigned long lastCommandId = 0;
 unsigned long lastCommandAt = 0;
 
+
+// ============================================================
+// STATUS LED
+// ============================================================
+
 unsigned long ledLastToggle = 0;
+
 byte errorTogglesRemaining = 0;
+
 bool ledState = true;
 
-void conveyorControl(bool run);
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
 void readSensors();
+
+bool attemptTrigger();
+
+void readSerialLines();
+
 void handleSerialCommand(char *line);
-void moveServoToCategory(const char *category);
-void queueEvent(const char *eventName, const char *argument);
+
+bool queueEvent(const char *eventName, const char *argument);
+
 void servicePendingEvent();
+
 void sendError(const char *code, unsigned long relatedId);
+
 void updateStatusLed();
+
 void signalError();
 
+
+// ============================================================
+// SETUP
+// ============================================================
+
 void setup() {
+
+  // Sensor inputs
   pinMode(IR_PIN, INPUT);
   pinMode(PROXIMITY_PIN, INPUT);
   pinMode(RAIN_PIN, INPUT);
-  pinMode(MOTOR_IN1_PIN, OUTPUT);
-  pinMode(MOTOR_IN2_PIN, OUTPUT);
-  pinMode(MOTOR_ENA_PIN, OUTPUT);
+
+  // Built-in LED
   pinMode(STATUS_LED_PIN, OUTPUT);
 
-  diverterServo.attach(SERVO_PIN);
-  diverterServo.write(SERVO_NEUTRAL_ANGLE);
-  conveyorControl(false); // Always boot with the motor stopped.
-
+  // Start USB serial communication
   Serial.begin(SERIAL_BAUD);
-  for (byte i = 0; i < 3; i++) { // Self-test: three LED blinks.
+
+  // Startup LED self-test:
+  // 3 short blinks
+  for (byte i = 0; i < 3; i++) {
+
     digitalWrite(STATUS_LED_PIN, HIGH);
     delay(180);
+
     digitalWrite(STATUS_LED_PIN, LOW);
     delay(180);
   }
-  digitalWrite(STATUS_LED_PIN, HIGH); // Solid LED means idle/ready.
-  Serial.println(F("HELLO:ARDUINO:1")); // Required SmartSeg v1 handshake.
+
+  // Solid LED = Arduino is powered and ready
+  digitalWrite(STATUS_LED_PIN, HIGH);
+
+  // Tell laptop that Arduino is alive.
+  Serial.println(F("HELLO:ARDUINO:1"));
 }
 
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
 void loop() {
+
+  // Check commands coming from laptop
   readSerialLines();
+
+  // Send/retry pending sensor events
   servicePendingEvent();
+
+  // Read IR + proximity + rain sensors
   readSensors();
 
-  // Fail open after a missed laptop response: avoid leaving waste/motor jammed.
-  if (waitingForClassification && millis() - triggerTime >= CLASSIFY_TIMEOUT_MS) {
+  // If laptop does not respond after an IR trigger,
+  // cancel the waiting state.
+  //
+  // IMPORTANT:
+  // There is NO conveyor restart here because no motor
+  // is connected in this prototype.
+  if (
+    waitingForClassification &&
+    millis() - triggerTime >= CLASSIFY_TIMEOUT_MS
+  ) {
+
     waitingForClassification = false;
+
     sendError("TIMEOUT", 0);
-    conveyorControl(true);
-    signalError();
   }
+
+  // Update built-in LED status
   updateStatusLed();
 }
 
-void readSensors() {
-  bool irPresent = (digitalRead(IR_PIN) == (IR_ACTIVE_HIGH ? HIGH : LOW));
-  // Rising edge into the detection state starts one cycle only.
-  if (irPresent && !previousIrPresent && !waitingForClassification && sessionReady) {
-    int proximity = analogRead(PROXIMITY_PIN);
-    int rain = analogRead(RAIN_PIN);
-    char context[40];
-    // Prompt 2 sensor-fusion payload. The laptop parser accepts this combined form.
-    snprintf(context, sizeof(context), "PROX=%d,RAIN=%d", proximity, rain);
-    conveyorControl(false);
-    waitingForClassification = true;
-    triggerTime = millis();
-    queueEvent("IR_TRIGGERED", context);
+
+// ============================================================
+// SENSOR READING
+// ============================================================
+
+/*
+  Shared trigger logic.
+
+  Both the automatic IR pin detection AND the manual
+  MANUAL_TRIGGER serial command call this same function, so
+  they behave identically: same guard conditions, same real
+  proximity/rain readings, same event format. The only
+  difference between the two trigger sources is WHAT decides
+  the moment to call this - a sensor edge, or a keypress
+  relayed from the laptop.
+
+  Returns true if a trigger was actually queued.
+*/
+bool attemptTrigger() {
+
+  // Refuse to trigger while another event (e.g. SENSOR_READY)
+  // is still pending an ACK, or while a previous trigger is
+  // still awaiting a classification reply, or before the
+  // laptop handshake has completed.
+  if (
+    waitingForClassification ||
+    pendingEvent ||
+    !sessionReady
+  ) {
+
+    return false;
   }
+
+  // Read proximity sensor
+  // int proximity = digitalRead(PROXIMITY_PIN);
+
+  // // Read rain sensor
+  // int rain = analogRead(RAIN_PIN);
+  int proximityDigital = digitalRead(PROXIMITY_PIN);
+  int proximity = proximityDigital ? 1023 : 0;
+
+  int rain = analogRead(RAIN_PIN);
+    // Build sensor payload
+  char context[40];
+
+  snprintf(
+    context,
+    sizeof(context),
+    "PROX=%d,RAIN=%d",
+    proximity,
+    rain
+  );
+
+  // Only mark ourselves as waiting for classification if
+  // the event actually got queued successfully.
+  bool queued = queueEvent(
+    "IR_TRIGGERED",
+    context
+  );
+
+  if (queued) {
+
+    waitingForClassification = true;
+
+    triggerTime = millis();
+  }
+
+  return queued;
+}
+
+
+void readSensors() {
+
+  // Read IR sensor
+  bool irPresent =
+    (digitalRead(IR_PIN) ==
+     (IR_ACTIVE_HIGH ? HIGH : LOW));
+
+
+  /*
+    Detect only the transition:
+
+        NO OBJECT -> OBJECT
+
+    This prevents the Arduino from sending hundreds
+    of events while the same object remains in front
+    of the IR sensor.
+
+    The IR sensor stays fully wired and functional here -
+    this path fires automatically on a real detection, exactly
+    as before. It shares attemptTrigger() with the manual
+    command path below, so the guard conditions and event
+    format are identical either way.
+  */
+
+  if (
+    irPresent &&
+    !previousIrPresent
+  ) {
+
+    attemptTrigger();
+  }
+
+  // Store current IR state for rising-edge detection
   previousIrPresent = irPresent;
 }
 
+
+// ============================================================
+// SERIAL INPUT
+// ============================================================
+
 void readSerialLines() {
+
   while (Serial.available() > 0) {
+
     char incoming = (char)Serial.read();
-    if (incoming == '\r') continue;
+
+    // Ignore carriage return
+    if (incoming == '\r') {
+      continue;
+    }
+
+    // End of line
     if (incoming == '\n') {
+
       if (lineOverflow) {
+
         sendError("FRAME", 0);
-      } else if (lineLength > 0) {
+
+      }
+      else if (lineLength > 0) {
+
         lineBuffer[lineLength] = '\0';
+
         handleSerialCommand(lineBuffer);
       }
+
+      // Reset buffer
       lineLength = 0;
       lineOverflow = false;
-    } else if (lineLength < sizeof(lineBuffer) - 1) {
+    }
+
+    // Add character to buffer
+    else if (lineLength < sizeof(lineBuffer) - 1) {
+
       lineBuffer[lineLength++] = incoming;
-    } else {
+    }
+
+    // Buffer overflow
+    else {
+
       lineOverflow = true;
     }
   }
 }
 
+
+// ============================================================
+// SERIAL COMMAND HANDLER
+// ============================================================
+
 void handleSerialCommand(char *line) {
-  // Handshake is neither an event nor a correlated command.
+
+  // ----------------------------------------------------------
+  // Laptop handshake
+  // ----------------------------------------------------------
+
   if (strcmp(line, "HELLO:LAPTOP:1") == 0) {
+
     sessionReady = true;
-    queueEvent("CONVEYOR_READY", NULL);
+
+    // Sensor-only firmware: no conveyor exists, so we tell
+    // the laptop the sensor stage is ready, not a conveyor.
+    queueEvent("SENSOR_READY", NULL);
+
     return;
   }
+
+
+  // ----------------------------------------------------------
+  // Event acknowledgement
+  // ----------------------------------------------------------
 
   if (strncmp(line, "ACK:", 4) == 0) {
-    unsigned long ackId = strtoul(line + 4, NULL, 10);
-    if (pendingEvent && ackId == pendingEventId) pendingEvent = false;
+
+    unsigned long ackId =
+      strtoul(line + 4, NULL, 10);
+
+    if (
+      pendingEvent &&
+      ackId == pendingEventId
+    ) {
+
+      pendingEvent = false;
+    }
+
     return;
   }
 
-  // Normal SmartSeg v1 form: CMD:<positive-id>:<command>[:argument]
+
+  // ----------------------------------------------------------
+  // CMD:<id>:<command>[:argument]
+  // ----------------------------------------------------------
+
   unsigned long commandId = 0;
+
   char *command = NULL;
+
   char *argument = NULL;
+
   bool correlated = false;
+
+
   if (strncmp(line, "CMD:", 4) == 0) {
+
     char *save = NULL;
-    strtok_r(line, ":", &save); // CMD
-    char *idText = strtok_r(NULL, ":", &save);
-    command = strtok_r(NULL, ":", &save);
-    argument = strtok_r(NULL, ":", &save);
-    if (!idText || !command || strtoul(idText, NULL, 10) == 0) {
+
+    // CMD
+    strtok_r(line, ":", &save);
+
+    // ID
+    char *idText =
+      strtok_r(NULL, ":", &save);
+
+    // COMMAND
+    command =
+      strtok_r(NULL, ":", &save);
+
+    // ARGUMENT
+    argument =
+      strtok_r(NULL, ":", &save);
+
+
+    // Validate command ID
+    if (
+      !idText ||
+      !command ||
+      strtoul(idText, NULL, 10) == 0
+    ) {
+
       sendError("FRAME", 0);
+
       return;
     }
-    commandId = strtoul(idText, NULL, 10);
+
+
+    commandId =
+      strtoul(idText, NULL, 10);
+
     correlated = true;
-  } else {
-    // Bench-only convenience: Serial Monitor can send CLASSIFY:PLASTIC directly.
-    char *save = NULL;
-    command = strtok_r(line, ":", &save);
-    argument = strtok_r(NULL, ":", &save);
   }
 
+
+  // ----------------------------------------------------------
+  // Correlated command handling
+  // ----------------------------------------------------------
+
   if (correlated) {
+
+    // Laptop must perform handshake first
     if (!sessionReady) {
+
       sendError("NOT_READY", commandId);
+
       return;
     }
-    if (commandId == lastCommandId && millis() - lastCommandAt < DUPLICATE_WINDOW_MS) {
-      Serial.print(F("ACK:")); Serial.println(commandId);
-      return; // Deduplicated retransmission: never move servo/motor twice.
+
+
+    // Prevent duplicate commands
+    if (
+      commandId == lastCommandId &&
+      millis() - lastCommandAt < DUPLICATE_WINDOW_MS
+    ) {
+
+      Serial.print(F("ACK:"));
+      Serial.println(commandId);
+
+      return;
     }
-    Serial.print(F("ACK:")); Serial.println(commandId);
+
+
+    // Acknowledge command
+    Serial.print(F("ACK:"));
+    Serial.println(commandId);
+
     lastCommandId = commandId;
+
     lastCommandAt = millis();
   }
 
-  if (!command) {
-    sendError("UNKNOWN_CMD", commandId);
-  } else if (strcmp(command, "CONVEYOR_START") == 0 && argument == NULL) {
-    conveyorControl(true);
-  } else if (strcmp(command, "CONVEYOR_STOP") == 0 && argument == NULL) {
-    conveyorControl(false);
-  } else if (strcmp(command, "CLASSIFY") == 0 && argument != NULL) {
-    if (!waitingForClassification && correlated) {
-      sendError("BUSY", commandId);
-      return;
-    }
-    if (strcmp(argument, "PLASTIC") && strcmp(argument, "ORGANIC") &&
-        strcmp(argument, "METAL") && strcmp(argument, "OTHER")) {
+
+  // ----------------------------------------------------------
+  // CLASSIFY command
+  // ----------------------------------------------------------
+
+  if (
+    command != NULL &&
+    strcmp(command, "CLASSIFY") == 0 &&
+    argument != NULL
+  ) {
+
+    // Validate category
+    if (
+      strcmp(argument, "PLASTIC") != 0 &&
+      strcmp(argument, "ORGANIC") != 0 &&
+      strcmp(argument, "METAL") != 0 &&
+      strcmp(argument, "OTHER") != 0
+    ) {
+
       sendError("UNKNOWN_CMD", commandId);
+
       return;
     }
-    moveServoToCategory(argument);
-  } else {
-    sendError("UNKNOWN_CMD", commandId);
-  }
-}
 
-void moveServoToCategory(const char *category) {
-  int targetAngle = OTHER_ANGLE;
-  if (strcmp(category, "PLASTIC") == 0) targetAngle = PLASTIC_ANGLE;
-  else if (strcmp(category, "ORGANIC") == 0) targetAngle = ORGANIC_ANGLE;
-  else if (strcmp(category, "METAL") == 0) targetAngle = METAL_ANGLE;
 
-  diverterServo.write(targetAngle);
-  delay(1200); // Enough time for a light item to leave the diverter gate.
-  diverterServo.write(SERVO_NEUTRAL_ANGLE);
-  delay(400);
-  waitingForClassification = false;
-  conveyorControl(true);
-  delay(700);  // Clear the item from the IR sensor before accepting another cycle.
-  conveyorControl(false);
-  queueEvent("SERVO_DONE", category);
-}
+    /*
+      SENSOR-ONLY MODE
 
-void conveyorControl(bool run) {
-  if (run) {
-    digitalWrite(MOTOR_IN1_PIN, HIGH);
-    digitalWrite(MOTOR_IN2_PIN, LOW);
-    digitalWrite(MOTOR_ENA_PIN, HIGH);
-  } else {
-    digitalWrite(MOTOR_IN1_PIN, LOW);
-    digitalWrite(MOTOR_IN2_PIN, LOW);
-    digitalWrite(MOTOR_ENA_PIN, LOW);
-  }
-}
+      The Arduino does NOT:
+        - move a servo
+        - rotate a stepper
+        - start a conveyor
+        - control a motor driver
 
-void queueEvent(const char *eventName, const char *argument) {
-  if (pendingEvent) {
-    // There should only be one outstanding protocol event; retain safety over noise.
-    sendError("BUSY", 0);
+      The laptop has already performed the classification.
+
+      We simply mark this waste cycle as completed.
+      "SERVO_DONE" is kept as the completion-event name since
+      it just means "classification cycle finished", which is
+      still accurate even with no physical servo attached.
+    */
+
+    waitingForClassification = false;
+
+    queueEvent(
+      "SERVO_DONE",
+      argument
+    );
+
     return;
   }
-  pendingEventId = nextEventId++;
-  if (argument) snprintf(pendingEventFrame, sizeof(pendingEventFrame), "EVT:%lu:%s:%s", pendingEventId, eventName, argument);
-  else snprintf(pendingEventFrame, sizeof(pendingEventFrame), "EVT:%lu:%s", pendingEventId, eventName);
-  pendingEvent = true;
-  pendingEventSends = 0;
-  pendingEventSentAt = 0; // servicePendingEvent sends immediately.
+
+
+  // ----------------------------------------------------------
+  // MANUAL_TRIGGER command
+  // ----------------------------------------------------------
+
+  /*
+    Lets the laptop fire the exact same event the IR sensor
+    would fire, on demand (e.g. an operator pressing Enter
+    during a demo). Proximity and rain readings are still
+    real, live sensor values - only the "an object arrived"
+    moment is manual instead of IR-detected.
+
+    The IR sensor itself is untouched and still fully wired
+    and active; this is simply an additional way to reach the
+    same attemptTrigger() call.
+  */
+
+  if (
+    command != NULL &&
+    strcmp(command, "MANUAL_TRIGGER") == 0
+  ) {
+
+    bool queued = attemptTrigger();
+
+    if (!queued) {
+
+      sendError("NOT_READY", commandId);
+    }
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Conveyor commands
+  // ----------------------------------------------------------
+
+  if (
+    command != NULL &&
+    (
+      strcmp(command, "CONVEYOR_START") == 0 ||
+      strcmp(command, "CONVEYOR_STOP") == 0
+    )
+  ) {
+
+    /*
+      Motors are NOT connected in this prototype.
+
+      Therefore these commands are intentionally ignored
+      after acknowledgement.
+
+      This prevents the Arduino from attempting to control
+      any absent motor hardware.
+    */
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Unknown command
+  // ----------------------------------------------------------
+
+  sendError(
+    "UNKNOWN_CMD",
+    commandId
+  );
 }
+
+
+// ============================================================
+// EVENT QUEUE
+// ============================================================
+
+// Returns true if the event was successfully queued, false if
+// rejected because another event is still pending an ACK.
+bool queueEvent(
+  const char *eventName,
+  const char *argument
+) {
+
+  // Only one event can be waiting for acknowledgement
+  if (pendingEvent) {
+
+    sendError("BUSY", 0);
+
+    return false;
+  }
+
+
+  pendingEventId = nextEventId++;
+
+
+  // Event with argument
+  if (argument) {
+
+    snprintf(
+      pendingEventFrame,
+      sizeof(pendingEventFrame),
+      "EVT:%lu:%s:%s",
+      pendingEventId,
+      eventName,
+      argument
+    );
+  }
+
+  // Event without argument
+  else {
+
+    snprintf(
+      pendingEventFrame,
+      sizeof(pendingEventFrame),
+      "EVT:%lu:%s",
+      pendingEventId,
+      eventName
+    );
+  }
+
+
+  pendingEvent = true;
+
+  pendingEventSends = 0;
+
+  // Send immediately on next service cycle
+  pendingEventSentAt = 0;
+
+  return true;
+}
+
+
+// ============================================================
+// EVENT TRANSMISSION / RETRY
+// ============================================================
 
 void servicePendingEvent() {
-  if (!pendingEvent) return;
-  unsigned long now = millis();
-  if (pendingEventSentAt != 0 && now - pendingEventSentAt < ACK_TIMEOUT_MS) return;
-  if (pendingEventSends >= MAX_EVENT_SENDS) {
-    pendingEvent = false;
-    sendError("LINK", pendingEventId);
-    conveyorControl(false);
-    signalError();
+
+  if (!pendingEvent) {
     return;
   }
+
+
+  unsigned long now = millis();
+
+
+  // Wait for ACK timeout before retrying
+  if (
+    pendingEventSentAt != 0 &&
+    now - pendingEventSentAt < ACK_TIMEOUT_MS
+  ) {
+
+    return;
+  }
+
+
+  // Too many failed transmissions
+  if (pendingEventSends >= MAX_EVENT_SENDS) {
+
+    pendingEvent = false;
+
+    sendError(
+      "LINK",
+      pendingEventId
+    );
+
+    return;
+  }
+
+
+  // Send event
   Serial.println(pendingEventFrame);
+
   pendingEventSends++;
+
   pendingEventSentAt = now;
 }
 
-void sendError(const char *code, unsigned long relatedId) {
+
+// ============================================================
+// ERROR MESSAGE
+// ============================================================
+
+void sendError(
+  const char *code,
+  unsigned long relatedId
+) {
+
   Serial.print(F("ERROR:"));
   Serial.print(code);
+
+
   if (relatedId > 0) {
+
     Serial.print(':');
     Serial.print(relatedId);
   }
+
+
   Serial.println();
+
   signalError();
 }
 
+
+// ============================================================
+// STATUS LED
+// ============================================================
+
 void updateStatusLed() {
+
   unsigned long now = millis();
+
+
+  // Error state
   if (errorTogglesRemaining > 0) {
-    if (now - ledLastToggle >= 350) {
+
+    if (
+      now - ledLastToggle >= 350
+    ) {
+
       ledLastToggle = now;
+
       ledState = !ledState;
-      digitalWrite(STATUS_LED_PIN, ledState);
+
+      digitalWrite(
+        STATUS_LED_PIN,
+        ledState
+      );
+
       errorTogglesRemaining--;
     }
-  } else if (waitingForClassification) {
-    if (now - ledLastToggle >= 120) {
+  }
+
+
+  // Waiting for laptop classification
+  else if (waitingForClassification) {
+
+    if (
+      now - ledLastToggle >= 120
+    ) {
+
       ledLastToggle = now;
+
       ledState = !ledState;
-      digitalWrite(STATUS_LED_PIN, ledState);
+
+      digitalWrite(
+        STATUS_LED_PIN,
+        ledState
+      );
     }
-  } else {
+  }
+
+
+  // Normal idle state
+  else {
+
     ledState = true;
-    digitalWrite(STATUS_LED_PIN, HIGH);
+
+    digitalWrite(
+      STATUS_LED_PIN,
+      HIGH
+    );
   }
 }
 
+
+// ============================================================
+// ERROR LED SIGNAL
+// ============================================================
+
 void signalError() {
-  errorTogglesRemaining = 6; // Three slow off/on blink cycles.
+
+  // 3 slow blink cycles
+  errorTogglesRemaining = 6;
+
   ledLastToggle = millis();
+
   ledState = true;
 }

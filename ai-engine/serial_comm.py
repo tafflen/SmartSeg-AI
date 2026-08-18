@@ -88,19 +88,28 @@ class SerialCommunicator:
             self._deferred_events.append(event)
 
     def classify_and_wait(self, category: str) -> bool:
-        # Command ACK follows v1's 3-send reliability rule. Servo completion gets one safe resend.
+        """
+        Sensor-only prototype:
+        Send the YOLO classification to Arduino and wait only for
+        the command ACK.
+
+        No servo, stepper, conveyor, or SERVO_DONE event is expected.
+        """
         command_id = self.send_command("CLASSIFY", category)
+
         if command_id is None:
+            LOGGER.error(
+                "Arduino did not acknowledge CLASSIFY:%s",
+                category,
+            )
             return False
-        for attempt in range(2):
-            done = self.wait_for_event("SERVO_DONE", config.SERVO_DONE_TIMEOUT_SECONDS)
-            if done and done.argument == category:
-                return True
-            if attempt == 0:
-                LOGGER.warning("SERVO_DONE timeout; retrying identical CLASSIFY frame once")
-                self._send_command_with_id(command_id, "CLASSIFY", category)
-        LOGGER.error("No SERVO_DONE for CLASSIFY:%s", category)
-        return False
+
+        LOGGER.info(
+            "Arduino acknowledged CLASSIFY:%s",
+            category,
+        )
+
+        return True
 
     def send_command(self, command: str, argument: str | None = None) -> int | None:
         with self._lock:

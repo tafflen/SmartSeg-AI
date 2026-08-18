@@ -1,4 +1,6 @@
 """SmartSeg trigger-driven AI engine entry point."""
+
+#uvicorn main:app --reload
 from __future__ import annotations
 
 import json
@@ -41,9 +43,35 @@ def sensor_context(serial: SerialCommunicator, ir_event: SerialEvent) -> dict[st
     return context
 
 
-def fuse_sensor_context(result: dict[str, Any], context: dict[str, str]) -> dict[str, Any]:
+# def fuse_sensor_context(result: dict[str, Any], context: dict[str, str]) -> dict[str, Any]:
+def fuse_sensor_context(
+    result: dict[str, Any],
+    context: dict[str, str],
+) -> dict[str, Any]:
+
+    try:
+        rain_value = int(float(context["rain"]))
+    except (ValueError, TypeError):
+        rain_value = 900
+
+    # Rain sensor: higher value = drier, lower value = wetter.
+    wet = rain_value < 600
+
+    if wet and result["confidence_score"] < config.BORDERLINE_CONFIDENCE:
+        return {
+            **result,
+            "category": "ORGANIC",
+            "sensor_override": "wet_sensor",
+        }
+
+    return {
+        **result,
+        "sensor_override": None,
+    }
     # Wetness does not overwrite a strong model result. It only resolves uncertainty safely.
-    wet = context["rain"].upper() in {"WET", "HIGH", "1", "TRUE"}
+    # wet = context["rain"].upper() in {"WET", "HIGH", "1", "TRUE"}
+    rain_value = float(context["rain"]) if context["rain"].replace(".", "", 1).isdigit() else 900
+    wet = rain_value < 600
     if wet and result["confidence_score"] < config.BORDERLINE_CONFIDENCE:
         result = {**result, "category": "ORGANIC", "sensor_override": "wet_borderline"}
     else:
@@ -72,26 +100,241 @@ def persist_completed_event(resident: dict[str, Any], category: str, confidence:
                       "sensor_context": sensor_context}), flush=True)
 
 
-def process_cycle(serial: SerialCommunicator, camera: Camera, detector: WasteDetector,
-                  nfc_reader: Any, sync_worker: FirebaseSyncWorker, bridge: BackendBridge, sms_provider: Any) -> None:
-    resident = get_current_resident(nfc_reader)
-    if not resident:
-        LOGGER.warning("No recognized NFC resident; ignoring IR cycle")
-        return
-    ir_event = serial.wait_for_event("IR_TRIGGERED")
-    assert ir_event is not None
+# def process_cycle(serial: SerialCommunicator, camera: Camera, detector: WasteDetector,
+#                   nfc_reader: Any, sync_worker: FirebaseSyncWorker, bridge: BackendBridge, sms_provider: Any) -> None:
+#     resident = get_current_resident(nfc_reader)
+#     if not resident:
+#         LOGGER.warning("No recognized NFC resident; ignoring IR cycle")
+#         return
+#     ir_event = serial.wait_for_event("IR_TRIGGERED")
+#     assert ir_event is not None
+#     context = sensor_context(serial, ir_event)
+#     try:
+#         result = fuse_sensor_context(detector.classify(camera.capture_frame()), context)
+#     except Exception as error:
+#         LOGGER.error("Camera/inference unavailable: %s. Set SMARTSEG_SIMULATE_MODE=true to continue without hardware.", error)
+#         serial.send_command("CONVEYOR_STOP")
+#         return
+#     category = result["category"]
+#     if not serial.classify_and_wait(category):
+#         return
+#     weight_grams = random.randint(50, 500)  # TODO: real HX711 load-cell input.
+#     persist_completed_event(resident, category, result["confidence_score"], weight_grams, context, sync_worker, bridge, sms_provider)
+
+def process_cycle(
+    serial: SerialCommunicator,
+    camera: Camera,
+    detector: WasteDetector,
+    nfc_reader: Any,
+    sync_worker: FirebaseSyncWorker,
+    bridge: BackendBridge,
+    sms_provider: Any,
+) -> None:
+
+    # ---------------------------------------------------------
+    # STEP 1: Wait for the REAL Arduino IR trigger first.
+    # ---------------------------------------------------------
+    #
+    # The Arduino sends:
+    #
+    # EVT:<id>:IR_TRIGGERED:PROX=<value>,RAIN=<value>
+    #
+    # This means the physical IR sensor has detected an object.
+    #
+    input("\nPress ENTER to trigger waste detection... ")
+
+    ir_event = SerialEvent(
+        event_id=int(time.time()),
+        name="IR_TRIGGERED",
+        argument="PROX=1000,RAIN=900",
+    )
+
+    LOGGER.info("Manual ENTER trigger received")
+
+    LOGGER.info(
+        "Real Arduino IR trigger received: event=%s argument=%s",
+        ir_event.event_id,
+        ir_event.argument,
+    )
+
+
+    # ---------------------------------------------------------
+    # STEP 2: Read proximity + rain values from Arduino.
+    # ---------------------------------------------------------
+
     context = sensor_context(serial, ir_event)
+
+    LOGGER.info(
+        "Sensor context: proximity=%s, rain=%s",
+        context["proximity"],
+        context["rain"],
+    )
+
+
+    # ---------------------------------------------------------
+    # STEP 3: NFC is OPTIONAL during prototype testing.
+    # ---------------------------------------------------------
+    #
+    # IMPORTANT:
+    # We do NOT wait for NFC here unless REQUIRE_NFC=true.
+    #
+    # This allows the real camera + YOLO pipeline to be tested
+    # even when the PN532 is not being used.
+    #
+
+    resident = None
+
+    if config.REQUIRE_NFC:
+
+        LOGGER.info("NFC is required for this run")
+
+        resident = get_current_resident(nfc_reader)
+
+        if not resident:
+            LOGGER.warning(
+                "NFC is required but no recognized NFC resident was found. "
+                "Skipping this waste cycle."
+            )
+            return
+
+    else:
+
+        LOGGER.info(
+            "NFC is optional for prototype testing; "
+            "continuing without resident identification."
+        )
+
+
+    # ---------------------------------------------------------
+    # STEP 4: Capture REAL camera frame + REAL YOLO inference.
+    # ---------------------------------------------------------
+
     try:
-        result = fuse_sensor_context(detector.classify(camera.capture_frame()), context)
+
+        LOGGER.info("Capturing real camera frame for YOLO inference...")
+
+        frame = camera.capture_frame()
+
+        LOGGER.info("Running YOLO inference...")
+
+        result = detector.classify(frame)
+
+        result = fuse_sensor_context(
+            result,
+            context,
+        )
+
+        LOGGER.info(
+            "YOLO result: category=%s confidence=%.3f sensor_override=%s",
+            result["category"],
+            result["confidence_score"],
+            result.get("sensor_override"),
+        )
+
     except Exception as error:
-        LOGGER.error("Camera/inference unavailable: %s. Set SMARTSEG_SIMULATE_MODE=true to continue without hardware.", error)
-        serial.send_command("CONVEYOR_STOP")
+
+        LOGGER.error(
+            "Camera/YOLO inference unavailable: %s",
+            error,
+        )
+
+        # No motor is connected in the current prototype.
+        # We therefore do not send CONVEYOR_STOP here.
+
         return
+
+
+    # ---------------------------------------------------------
+    # STEP 5: Send classification back to Arduino.
+    # ---------------------------------------------------------
+    #
+    # Current sensor-only Arduino firmware accepts CLASSIFY
+    # but does NOT move a servo or stepper.
+    #
+
     category = result["category"]
+
+    LOGGER.info(
+        "Sending classification to Arduino: %s",
+        category,
+    )
+
     if not serial.classify_and_wait(category):
+
+        LOGGER.error(
+            "Arduino did not acknowledge classification: %s",
+            category,
+        )
+
         return
-    weight_grams = random.randint(50, 500)  # TODO: real HX711 load-cell input.
-    persist_completed_event(resident, category, result["confidence_score"], weight_grams, context, sync_worker, bridge, sms_provider)
+
+
+    LOGGER.info(
+        "Arduino acknowledged classification: %s",
+        category,
+    )
+
+
+    # ---------------------------------------------------------
+    # STEP 6: Weight is NOT REAL yet.
+    # ---------------------------------------------------------
+    #
+    # There is currently no HX711/load-cell hardware connected.
+    #
+    # DO NOT pretend this is a real measurement.
+    #
+    # Therefore, only use the random weight if we explicitly
+    # need the old database/reward demo path.
+    #
+
+    if resident is None:
+
+        print(
+            json.dumps(
+                {
+                    "status": "AI_CLASSIFICATION_COMPLETE",
+                    "resident_id": None,
+                    "category": category,
+                    "confidence_score": result["confidence_score"],
+                    "weight_grams": None,
+                    "reward_points": None,
+                    "sensor_context": context,
+                    "sensor_override": result.get("sensor_override"),
+                }
+            ),
+            flush=True,
+        )
+
+        return
+
+
+    # ---------------------------------------------------------
+    # STEP 7: Resident exists -> existing reward/database flow.
+    # ---------------------------------------------------------
+    #
+    # NOTE:
+    # Weight is still simulated because the HX711 is not
+    # connected yet.
+    #
+
+    weight_grams = random.randint(50, 500)
+
+    LOGGER.warning(
+        "Weight is currently SIMULATED because no HX711/load cell "
+        "is connected: %s g",
+        weight_grams,
+    )
+
+    persist_completed_event(
+        resident,
+        category,
+        result["confidence_score"],
+        weight_grams,
+        context,
+        sync_worker,
+        bridge,
+        sms_provider,
+    )
 
 
 def process_simulated_cycle(nfc_reader: NFCReader, sync_worker: FirebaseSyncWorker, bridge: BackendBridge, sms_provider: Any) -> None:

@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# DETECTOR_MOCK_MODE = os.getenv("DETECTOR_MOCK_MODE", str(MOCK_MODE)).lower() == "true"
 
 AI_ENGINE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = AI_ENGINE_DIR.parent
+load_dotenv(PROJECT_ROOT / ".env")
 DATABASE_PATH = Path(os.getenv("SMARTSEG_DATABASE_PATH", PROJECT_ROOT / "smartseg.db"))
 SCHEMA_PATH = PROJECT_ROOT / "database" / "schema.sql"
 
-MOCK_MODE = os.getenv("SMARTSEG_MOCK_MODE", "true").lower() == "true"
+MOCK_MODE = os.getenv("SMARTSEG_MOCK_MODE", "false").lower() == "true"
 SIMULATE_MODE = os.getenv("SMARTSEG_SIMULATE_MODE", "false").lower() == "true"
 SIMULATE_INTERVAL_SECONDS = float(os.getenv("SMARTSEG_SIMULATE_INTERVAL", "5"))
 SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("SMARTSEG_SERIAL_PORT", "COM3"))
@@ -59,3 +63,5 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_PHONE = os.getenv("TWILIO_FROM_PHONE", "")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE", "")
+
+REQUIRE_NFC = os.getenv("SMARTSEG_REQUIRE_NFC", "false").lower() == "true"
